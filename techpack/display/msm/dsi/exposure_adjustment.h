@@ -37,5 +37,6 @@
 
 void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable);
 u32 ea_panel_calc_backlight(u32 bl_lvl);
+bool ea_panel_is_enabled(void);
 
 #endif /* EXPOSURE_ADJUSTMENT_H */

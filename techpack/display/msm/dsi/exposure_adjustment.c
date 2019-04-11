@@ -91,6 +91,7 @@ static int ea_panel_send_pcc(u32 bl_lvl)
 	return rc;
 }
 
+
 void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable)
 {
 	if (pcc_backlight_enable != enable) {
@@ -117,4 +118,9 @@ u32 ea_panel_calc_backlight(u32 bl_lvl)
 	} else {
 		return bl_lvl;
 	}
+}
+
+bool ea_panel_is_enabled(void)
+{
+	return pcc_backlight_enable;
 }
