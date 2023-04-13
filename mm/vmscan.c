@@ -2617,8 +2617,11 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 
-	if (mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
+	if (mem_cgroup_get_nr_swap_pages(memcg) <= 0) {
+		count_vm_event(current_is_kswapd() ? LRU_KSWAPD_SWAP_FULL:
+						     LRU_DIRECT_SWAP_FULL);
 		return 0;
+	}
 
 	return mem_cgroup_swappiness(memcg);
 }
@@ -2707,18 +2710,13 @@ void lru_gen_del_mm(struct mm_struct *mm)
 		if (!lruvec)
 			continue;
 
-		/* where the last iteration ended (exclusive) */
+		/* where the current iteration continues after */
+		if (lruvec->mm_state.head == &mm->lru_gen.list)
+			lruvec->mm_state.head = lruvec->mm_state.head->prev;
+
+		/* where the last iteration ended before */
 		if (lruvec->mm_state.tail == &mm->lru_gen.list)
 			lruvec->mm_state.tail = lruvec->mm_state.tail->next;
-
-		/* where the current iteration continues (inclusive) */
-		if (lruvec->mm_state.head != &mm->lru_gen.list)
-			continue;
-
-		lruvec->mm_state.head = lruvec->mm_state.head->next;
-		/* the deletion ends the current iteration */
-		if (lruvec->mm_state.head == &mm_list->fifo)
-			WRITE_ONCE(lruvec->mm_state.seq, lruvec->mm_state.seq + 1);
 	}
 
 	list_del_init(&mm->lru_gen.list);
@@ -2899,68 +2897,54 @@ static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
 			    struct mm_struct **iter)
 {
 	bool first = false;
-	bool last = true;
+	bool last = false;
 	struct mm_struct *mm = NULL;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct lru_gen_mm_list *mm_list = get_mm_list(memcg);
 	struct lru_gen_mm_state *mm_state = &lruvec->mm_state;
 
 	/*
-	 * There are four interesting cases for this page table walker:
-	 * 1. It tries to start a new iteration of mm_list with a stale max_seq;
-	 *    there is nothing left to do.
-	 * 2. It's the first of the current generation, and it needs to reset
-	 *    the Bloom filter for the next generation.
-	 * 3. It reaches the end of mm_list, and it needs to increment
-	 *    mm_state->seq; the iteration is done.
-	 * 4. It's the last of the current generation, and it needs to reset the
-	 *    mm stats counters for the next generation.
+	 * mm_state->seq is incremented after each iteration of mm_list. There
+	 * are three interesting cases for this page table walker:
+	 * 1. It tries to start a new iteration with a stale max_seq: there is
+	 *    nothing left to do.
+	 * 2. It started the next iteration: it needs to reset the Bloom filter
+	 *    so that a fresh set of PTE tables can be recorded.
+	 * 3. It ended the current iteration: it needs to reset the mm stats
+	 *    counters and tell its caller to increment max_seq.
 	 */
 	spin_lock(&mm_list->lock);
 
 	VM_WARN_ON_ONCE(mm_state->seq + 1 < walk->max_seq);
-	VM_WARN_ON_ONCE(*iter && mm_state->seq > walk->max_seq);
-	VM_WARN_ON_ONCE(*iter && !mm_state->nr_walkers);
 
-	if (walk->max_seq <= mm_state->seq) {
-		if (!*iter)
-			last = false;
+	if (walk->max_seq <= mm_state->seq)
 		goto done;
-	}
 
-	if (!mm_state->nr_walkers) {
-		VM_WARN_ON_ONCE(mm_state->head && mm_state->head != &mm_list->fifo);
+	if (!mm_state->head)
+		mm_state->head = &mm_list->fifo;
 
-		mm_state->head = mm_list->fifo.next;
+	if (mm_state->head == &mm_list->fifo)
 		first = true;
-	}
 
-	while (!mm && mm_state->head != &mm_list->fifo) {
-		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
-
+	do {
 		mm_state->head = mm_state->head->next;
+		if (mm_state->head == &mm_list->fifo) {
+			WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
+			last = true;
+			break;
+		}
 
 		/* force scan for those added after the last iteration */
-		if (!mm_state->tail || mm_state->tail == &mm->lru_gen.list) {
-			mm_state->tail = mm_state->head;
+		if (!mm_state->tail || mm_state->tail == mm_state->head) {
+			mm_state->tail = mm_state->head->next;
 			walk->force_scan = true;
 		}
 
+		mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
 		if (should_skip_mm(mm, walk))
 			mm = NULL;
-	}
-
-	if (mm_state->head == &mm_list->fifo)
-		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
+	} while (!mm);
 done:
-	if (*iter && !mm)
-		mm_state->nr_walkers--;
-	if (!*iter && mm)
-		mm_state->nr_walkers++;
-
-	if (mm_state->nr_walkers)
-		last = false;
-
 	if (*iter || last)
 		reset_mm_stats(lruvec, walk, last);
 
@@ -2988,9 +2972,9 @@ static bool iterate_mm_list_nowalk(struct lruvec *lruvec, unsigned long max_seq)
 
 	VM_WARN_ON_ONCE(mm_state->seq + 1 < max_seq);
 
-	if (max_seq > mm_state->seq && !mm_state->nr_walkers) {
-		VM_WARN_ON_ONCE(mm_state->head && mm_state->head != &mm_list->fifo);
-
+	if (max_seq > mm_state->seq) {
+		mm_state->head = NULL;
+		mm_state->tail = NULL;
 		WRITE_ONCE(mm_state->seq, mm_state->seq + 1);
 		reset_mm_stats(lruvec, NULL, true);
 		success = true;
@@ -3593,10 +3577,6 @@ restart:
 
 		walk_pmd_range(&val, addr, next, args);
 
-		/* a racy check to curtail the waiting time */
-		if (wq_has_sleeper(&walk->lruvec->mm_state.wait))
-			return 1;
-
 		if (need_resched() || walk->batched >= MAX_LRU_BATCH) {
 			end = (addr | ~PUD_MASK) + 1;
 			goto done;
@@ -3631,7 +3611,13 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
 	walk->next_addr = FIRST_USER_ADDRESS;
 
 	do {
+		DEFINE_MAX_SEQ(lruvec);
+
 		err = -EBUSY;
+
+		/* another thread might have called inc_max_seq() */
+		if (walk->max_seq != max_seq)
+			break;
 
 		/* page_update_gen() requires stable page_memcg() */
 		if (!mem_cgroup_trylock_pages(memcg))
@@ -3868,28 +3854,12 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
 		success = iterate_mm_list(lruvec, walk, &mm);
 		if (mm)
 			walk_mm(lruvec, mm, walk);
-
-		cond_resched();
 	} while (mm);
 done:
-	if (!success) {
-		if (sc->priority <= DEF_PRIORITY - 2)
-			wait_event_killable(lruvec->mm_state.wait,
-					    max_seq < READ_ONCE(lrugen->max_seq));
+	if (success)
+		inc_max_seq(lruvec, can_swap, force_scan);
 
-		return max_seq < READ_ONCE(lrugen->max_seq);
-	}
-
-	VM_WARN_ON_ONCE(max_seq != READ_ONCE(lrugen->max_seq));
-
-	inc_max_seq(lruvec, can_swap, force_scan);
-	/* either this sees any waiters or they will see updated max_seq */
-	if (wq_has_sleeper(&lruvec->mm_state.wait))
-		wake_up_all(&lruvec->mm_state.wait);
-
-	wakeup_flusher_threads(WB_REASON_VMSCAN);
-
-	return true;
+	return success;
 }
 
 static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,
@@ -4031,10 +4001,9 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	 * younger than min_ttl. However, another possibility is all memcgs are
 	 * either below min or empty.
 	 */
-	if (mutex_trylock(&oom_lock)) {
+	if (!sc->order && mutex_trylock(&oom_lock)) {
 		struct oom_control oc = {
 			.gfp_mask = sc->gfp_mask,
-			.order = sc->order,
 		};
 
 		out_of_memory(&oc);
@@ -4244,8 +4213,13 @@ static bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_c
 
 	/* swapping inhibited */
 	if (!(sc->may_writepage && (sc->gfp_mask & __GFP_IO)) &&
-	    (PageDirty(page) || (PageAnon(page) && !PageSwapCache(page))))
+	    (PageDirty(page) || (PageAnon(page) && !PageSwapCache(page)))) {
+		if (!sc->may_writepage)
+			__count_vm_event(LRU_NO_WRITEPAGE);
+		if (!(sc->gfp_mask & __GFP_IO))
+			__count_vm_event(LRU_NO_GFP_IO);
 		return false;
+	}
 
 	/* raced with release_pages() */
 	if (!get_page_unless_zero(page))
@@ -4444,9 +4418,12 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	int scanned;
 	int reclaimed;
 	LIST_HEAD(list);
+	LIST_HEAD(clean);
 	struct page *page;
+	struct page *next;
 	enum vm_event_item item;
 	struct lru_gen_mm_walk *walk;
+	bool skip_retry = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -4464,18 +4441,37 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	if (list_empty(&list))
 		return scanned;
 
+retry:
 	reclaimed = shrink_page_list(&list, pgdat, sc, 0, NULL, false);
+	sc->nr_reclaimed += reclaimed;
 
-	list_for_each_entry(page, &list, lru) {
-		/* restore LRU_REFS_FLAGS cleared by isolate_page() */
-		if (PageWorkingset(page))
-			SetPageReferenced(page);
+	list_for_each_entry_safe_reverse(page, next, &list, lru) {
+		if (!page_evictable(page)) {
+			list_del(&page->lru);
+			putback_lru_page(page);
+			continue;
+		}
 
-		/* don't add rejected pages to the oldest generation */
-		if (PageReclaim(page) && (PageDirty(page) || PageWriteback(page)))
-			ClearPageActive(page);
-		else
-			SetPageActive(page);
+		if (PageReclaim(page) &&
+		    (PageDirty(page) || PageWriteback(page))) {
+			/* restore LRU_REFS_FLAGS cleared by isolate_page() */
+			if (PageWorkingset(page))
+				SetPageReferenced(page);
+			continue;
+		}
+
+		if (skip_retry || PageActive(page) || PageReferenced(page) ||
+		    page_mapped(page) || PageLocked(page) ||
+		    PageDirty(page) || PageWriteback(page)) {
+			/* don't add rejected pages to the oldest generation */
+			set_mask_bits(&page->flags, LRU_REFS_MASK | LRU_REFS_FLAGS,
+				      BIT(PG_active));
+			continue;
+		}
+
+		/* retry pages that may have missed rotate_reclaimable_page() */
+		list_move(&page->lru, &clean);
+		sc->nr_scanned -= hpage_nr_pages(page);
 	}
 
 	spin_lock_irq(&pgdat->lru_lock);
@@ -4496,7 +4492,18 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	mem_cgroup_uncharge_list(&list);
 	free_unref_page_list(&list);
 
-	sc->nr_reclaimed += reclaimed;
+	if (!reclaimed) {
+		item = current_is_kswapd() ? LRU_KSWAPD_ANON : LRU_DIRECT_ANON;
+		count_vm_event(item + type);
+	}
+
+	INIT_LIST_HEAD(&list);
+	list_splice_init(&clean, &list);
+
+	if (!list_empty(&list)) {
+		skip_retry = true;
+		goto retry;
+	}
 
 	if (need_swapping && type == LRU_GEN_ANON)
 		*need_swapping = true;
@@ -5258,7 +5265,6 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 		INIT_LIST_HEAD(&lrugen->lists[gen][type][zone]);
 
 	lruvec->mm_state.seq = MIN_NR_GENS;
-	init_waitqueue_head(&lruvec->mm_state.wait);
 }
 
 #ifdef CONFIG_MEMCG
@@ -6555,8 +6561,11 @@ restart:
 			sc.priority--;
 	} while (sc.priority >= 1);
 
-	if (!sc.nr_reclaimed)
-		pgdat->kswapd_failures++;
+	if (!sc.nr_reclaimed) {
+		count_vm_event(LRU_KSWAPD_NO_PROGRESS);
+		if (!lru_gen_enabled())
+			pgdat->kswapd_failures++;
+	}
 
 out:
 	/* If reclaim was boosted, account for the reclaim done in this pass */
