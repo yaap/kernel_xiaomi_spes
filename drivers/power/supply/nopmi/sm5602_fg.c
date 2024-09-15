@@ -1637,11 +1637,106 @@ static const struct attribute_group fg_attr_group = {
 	.attrs = fg_attributes,
 };
 
+static int calculate_delta_time(ktime_t time_stamp, int *delta_time_s)
+{
+	ktime_t now_time;
+
+	now_time = ktime_get();
+	*delta_time_s = ktime_ms_delta(now_time, time_stamp) / 1000;
+	if (*delta_time_s < 0)
+		*delta_time_s = 0;
+	return 0;
+}
+
+#define LOW_TBAT_THRESHOLD	15 // Degree - 15
 static void battery_soc_smooth_tracking_new(struct sm_fg_chip *sm)
 {
-	static int system_soc;
+	static int system_soc, last_system_soc, raw_soc;
+	int soc_changed = 0, unit_time = 10, delta_time = 0, soc_delta = 0;
+	static ktime_t last_change_time;
+	static int firstcheck = 0;
+	int change_delta = 0, rc = 0;
+	union power_supply_propval prop = {0, };
+	int charging_status = 0, charge_type = 0;
 
-	system_soc = sm->param.batt_raw_soc * 10;
+	if (!sm->usb_psy)
+		sm->usb_psy = power_supply_get_by_name("usb");
+	if (sm->usb_psy) {
+		rc = power_supply_get_property(sm->usb_psy,
+				POWER_SUPPLY_PROP_REAL_TYPE, &prop);
+		if (rc < 0) {
+			pr_err("sm could not get real type!\n");
+		}
+		charge_type = prop.intval;
+	}
+	if (!sm->batt_psy)
+		sm->batt_psy = power_supply_get_by_name("battery");
+	if (sm->batt_psy) {
+		rc = power_supply_get_property(sm->batt_psy,
+				POWER_SUPPLY_PROP_STATUS, &prop);
+		if (rc < 0) {
+			pr_err("sm could not get status!\n");
+		}
+		charging_status = prop.intval;
+	}
+	raw_soc = sm->param.batt_raw_soc * 10;
+
+	/* Map system_soc value according to raw_soc */
+	if (raw_soc >= 9700) {
+		system_soc = 100;
+	} else {
+		system_soc = ((raw_soc + 96) / 97);
+		if (system_soc > 99)
+			system_soc = 99;
+	}
+	pr_info("smooth_tracking_new: charge_type:%d, charging_status:%d, raw_soc:%d, system_soc:%d\n",
+		charge_type, charging_status, raw_soc, system_soc);
+
+	/* Get the initial value for the first time */
+	if (!firstcheck) {
+		last_change_time = ktime_get();
+		last_system_soc = system_soc;
+		firstcheck = 1;
+	}
+
+	if ((charging_status == POWER_SUPPLY_STATUS_DISCHARGING || charging_status == POWER_SUPPLY_STATUS_NOT_CHARGING) && !sm->batt_rmc && sm->batt_temp < LOW_TBAT_THRESHOLD && last_system_soc > 1) {
+		unit_time = 50;
+	}
+
+	/* If the soc jump, will smooth one cap every 10S */
+	soc_delta = abs(system_soc - last_system_soc);
+	if (soc_delta > 1 || (sm->batt_volt < 3300 && system_soc > 0)) {
+		calculate_delta_time(last_change_time, &change_delta);
+		delta_time = change_delta / unit_time;
+		if (delta_time < 0) {
+			last_change_time = ktime_get();
+			delta_time = 0;
+		}
+		soc_changed = min(1, delta_time);
+		if (soc_changed) {
+			if ((sm->batt_curr > 0 || charging_status == POWER_SUPPLY_STATUS_CHARGING) && (system_soc > last_system_soc))
+				system_soc = last_system_soc + soc_changed;
+			else if ((sm->batt_curr < 0 || charging_status == POWER_SUPPLY_STATUS_DISCHARGING || (charging_status == POWER_SUPPLY_STATUS_CHARGING && charge_type == POWER_SUPPLY_TYPE_USB)) && (system_soc < last_system_soc))
+				system_soc = last_system_soc - soc_changed;
+			else
+				system_soc = last_system_soc;
+			pr_info("soc_changed:%d charging_status:%d", soc_changed, charging_status);
+		} else {
+			system_soc = last_system_soc;
+		}
+	}
+
+	/* Avoid mismatches between charging status and soc changes */
+	if (charging_status == POWER_SUPPLY_STATUS_DISCHARGING && (system_soc > last_system_soc))
+		system_soc = last_system_soc;
+
+	pr_info("smooth_new: sys_soc:%d, last_sys_soc:%d, soc_delta:%d",
+		system_soc, last_system_soc, soc_delta);
+
+	if (system_soc != last_system_soc) {
+		last_change_time = ktime_get();
+		last_system_soc = system_soc;
+	}
 	sm->param.batt_soc = system_soc * 10;
 }
 
