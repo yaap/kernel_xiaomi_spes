@@ -413,7 +413,7 @@ static size_t ZSTD_copyRawBlock(void *dst, size_t dstCapacity, const void *src, 
 {
 	if (srcSize > dstCapacity)
 		return ERROR(dstSize_tooSmall);
-	memmove(dst, src, srcSize);
+	memcpy(dst, src, srcSize);
 	return srcSize;
 }
 
@@ -1589,7 +1589,6 @@ static size_t ZSTD_decompressFrame(ZSTD_DCtx *dctx, void *dst, size_t dstCapacit
 
 	/* Loop on each block */
 	while (1) {
-		BYTE* oBlockEnd = oend;
 		size_t decodedSize;
 		blockProperties_t blockProperties;
 		size_t const cBlockSize = ZSTD_getcBlockSize(ip, remainingSize, &blockProperties);
@@ -1601,27 +1600,10 @@ static size_t ZSTD_decompressFrame(ZSTD_DCtx *dctx, void *dst, size_t dstCapacit
 		if (cBlockSize > remainingSize)
 			return ERROR(srcSize_wrong);
 
-		if (ip >= op && ip < oBlockEnd) {
-			/* We are decompressing in-place. Limit the output pointer so that we
-			 * don't overwrite the block that we are currently reading. This will
-			 * fail decompression if the input & output pointers aren't spaced far enough apart.
-			 *
-			 * This is important to set, even when the pointers are far enough
-			 * apart, because ZSTD_decompressBlock_internal() can decide to store
-			 * literals in the output buffer, after the block it is decompressing.
-			 * Since we don't want anything to overwrite our input, we have to tell
-			 * ZSTD_decompressBlock_internal to never write past ip.
-			 *
-			 * See ZSTD_allocateLiteralsBuffer() for reference.
-			 */
-			oBlockEnd = op + (ip - op);
-		}
-
 		switch (blockProperties.blockType) {
-		case bt_compressed: decodedSize = ZSTD_decompressBlock_internal(dctx, op, oBlockEnd - op, ip, cBlockSize); break;
-		/* Use oend instead of oBlockEnd because this function is safe to overlap. It uses memmove. */
+		case bt_compressed: decodedSize = ZSTD_decompressBlock_internal(dctx, op, oend - op, ip, cBlockSize); break;
 		case bt_raw: decodedSize = ZSTD_copyRawBlock(op, oend - op, ip, cBlockSize); break;
-		case bt_rle: decodedSize = ZSTD_generateNxBytes(op, oBlockEnd - op, *ip, blockProperties.origSize); break;
+		case bt_rle: decodedSize = ZSTD_generateNxBytes(op, oend - op, *ip, blockProperties.origSize); break;
 		case bt_reserved:
 		default: return ERROR(corruption_detected);
 		}
@@ -1786,7 +1768,6 @@ size_t ZSTD_decompressContinue(ZSTD_DCtx *dctx, void *dst, size_t dstCapacity, c
 			return 0;
 		}
 		dctx->expected = 0; /* not necessary to copy more */
-		/* fall through */
 
 	case ZSTDds_decodeFrameHeader:
 		memcpy(dctx->headerBuffer + ZSTD_frameHeaderSize_prefix, src, dctx->expected);
@@ -2394,7 +2375,7 @@ size_t ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inB
 			}
 			zds->stage = zdss_read;
 		}
-		/* fall through */
+		/* pass-through */
 
 		case zdss_read: {
 			size_t const neededInSize = ZSTD_nextSrcSizeToDecompress(zds->dctx);
@@ -2423,7 +2404,6 @@ size_t ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inB
 			zds->stage = zdss_load;
 			/* pass-through */
 		}
-		/* fall through */
 
 		case zdss_load: {
 			size_t const neededInSize = ZSTD_nextSrcSizeToDecompress(zds->dctx);
@@ -2456,7 +2436,6 @@ size_t ZSTD_decompressStream(ZSTD_DStream *zds, ZSTD_outBuffer *output, ZSTD_inB
 				/* pass-through */
 			}
 		}
-		/* fall through */
 
 		case zdss_flush: {
 			size_t const toFlushSize = zds->outEnd - zds->outStart;
